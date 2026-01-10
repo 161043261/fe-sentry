@@ -1,5 +1,5 @@
+from io import TextIOWrapper
 import logging
-import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,7 @@ info_logger: Optional[logging.Logger] = None
 error_logger: Optional[logging.Logger] = None
 
 # SDK log state
-_sdk_file: Optional[object] = None
+_sdk_file: Optional[TextIOWrapper] = None
 _sdk_lock = threading.Lock()
 _current_month: str = ""
 _current_day: str = ""
@@ -125,7 +125,7 @@ def write_sdk_log(data: bytes) -> None:
 
         if _sdk_file:
             content = data.decode("utf-8") if isinstance(data, bytes) else data
-            _sdk_file.write(content + "\n")
+            _sdk_file.write(str(content) + "\n")
             _sdk_file.flush()
             _current_size += len(content) + 1
 

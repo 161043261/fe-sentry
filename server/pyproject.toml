@@ -3,7 +3,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.6",
   "pyyaml>=6.0.2",
-  "kafka-python>=2.0.2",
+  "aiokafka>=0.10.0",
   "pydantic>=2.9.2",
 ]
 description = "Frontend monitoring SDK server"
@@ -11,12 +11,13 @@ name = "fe-sentry-server"
 requires-python = ">=3.10"
 version = "0.1.0"
 
-[project.scripts]
-fe-sentry-server = "main:main"
+[tool.uv]
+package = false
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0.0",
-    "httpx>=0.27.0",
-    "ruff>=0.14.11",
+  "pytest>=8.0.0",
+  "httpx>=0.27.0",
+  "ruff>=0.14.11",
+  "mypy>=1.19.1",
 ]

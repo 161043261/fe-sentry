@@ -1,25 +1,22 @@
-import threading
-import time
+import asyncio
 from typing import Optional
 
-from kafka import KafkaProducer as KProducer
-from kafka import KafkaConsumer as KConsumer
-from kafka.errors import KafkaError
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from aiokafka.errors import KafkaError
 
 from config import cfg
 import logger
 
 # Producer state
-_producer: Optional[KProducer] = None
+_producer: Optional[AIOKafkaProducer] = None
 _enabled: bool = False
-_lock = threading.Lock()
 
 # Consumer state
-_consumer_thread: Optional[threading.Thread] = None
-_consumer_stop_event = threading.Event()
+_consumer: Optional[AIOKafkaConsumer] = None
+_consumer_task: Optional[asyncio.Task] = None
 
 
-def init_producer() -> None:
+async def init_producer() -> None:
     """Initialize Kafka Producer (if enabled)"""
     global _producer, _enabled
 
@@ -32,13 +29,12 @@ def init_producer() -> None:
         return
 
     try:
-        _producer = KProducer(
-            bootstrap_servers=cfg.kafka.brokers,
+        _producer = AIOKafkaProducer(
+            bootstrap_servers=",".join(cfg.kafka.brokers),
             acks="all",
-            retries=3,
-            value_serializer=lambda v: v if isinstance(v, bytes) else v.encode("utf-8"),
-            key_serializer=lambda k: k.encode("utf-8") if k else None,
+            retry_backoff_ms=100,
         )
+        await _producer.start()
         _enabled = True
         if logger.info_logger:
             logger.info_logger.info("Kafka producer initialized")
@@ -50,24 +46,24 @@ def init_producer() -> None:
         _enabled = False
 
 
-def close_producer() -> None:
+async def close_producer() -> None:
     """Close Kafka Producer"""
     global _producer
 
     if _producer:
-        _producer.close()
+        await _producer.stop()
         _producer = None
 
 
-def send_log(key: str, data: bytes) -> None:
+async def send_log(key: str, data: bytes) -> None:
     """Send log to Kafka"""
     global _producer, _enabled
 
     if not _enabled or not _producer:
         raise RuntimeError("Kafka not available")
 
-    _producer.send(cfg.kafka.topic, key=key, value=data)
-    _producer.flush()
+    key_bytes = key.encode("utf-8") if key else None
+    await _producer.send_and_wait(cfg.kafka.topic, value=data, key=key_bytes)
 
 
 def is_enabled() -> bool:
@@ -80,49 +76,54 @@ def is_healthy() -> bool:
     return _enabled and _producer is not None
 
 
-def _disable_kafka() -> None:
+async def _disable_kafka() -> None:
     """Disable Kafka, fallback to direct file write"""
     global _enabled, _producer
 
     _enabled = False
     if _producer:
-        _producer.close()
+        await _producer.stop()
         _producer = None
 
 
-def _consumer_loop() -> None:
-    """Consumer loop running in background thread"""
+async def _consumer_loop() -> None:
+    """Consumer loop running as async task"""
+    global _consumer
+
     try:
-        consumer = KConsumer(
+        _consumer = AIOKafkaConsumer(
             cfg.kafka.topic,
-            bootstrap_servers=cfg.kafka.brokers,
+            bootstrap_servers=",".join(cfg.kafka.brokers),
             group_id=cfg.kafka.group_id,
             auto_offset_reset="latest",
             enable_auto_commit=True,
         )
+        await _consumer.start()
 
         if logger.info_logger:
             logger.info_logger.info("Kafka consumer started")
 
-        while not _consumer_stop_event.is_set():
-            messages = consumer.poll(timeout_ms=1000)
-            for tp, msgs in messages.items():
-                for msg in msgs:
-                    try:
-                        logger.write_sdk_log(msg.value)
-                    except Exception as e:
-                        if logger.error_logger:
-                            logger.error_logger.error(f"Failed to write log: {e}")
+        async for msg in _consumer:
+            try:
+                logger.write_sdk_log(msg.value)
+            except Exception as e:
+                if logger.error_logger:
+                    logger.error_logger.error(f"Failed to write log: {e}")
 
-        consumer.close()
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         if logger.error_logger:
             logger.error_logger.error(f"Consumer error: {e}")
+    finally:
+        if _consumer:
+            await _consumer.stop()
+            _consumer = None
 
 
-def start_consumer_with_retry() -> None:
+async def start_consumer_with_retry() -> None:
     """Start Kafka consumer with retry"""
-    global _consumer_thread
+    global _consumer_task
 
     if not is_enabled():
         if logger.info_logger:
@@ -136,37 +137,39 @@ def start_consumer_with_retry() -> None:
     for i in range(retry_max):
         try:
             # Test connection
-            test_consumer = KConsumer(
-                bootstrap_servers=kafka_cfg.brokers,
+            test_consumer = AIOKafkaConsumer(
+                bootstrap_servers=",".join(kafka_cfg.brokers),
                 group_id=kafka_cfg.group_id,
             )
-            test_consumer.close()
+            await test_consumer.start()
+            await test_consumer.stop()
 
-            # Start consumer thread
-            _consumer_stop_event.clear()
-            _consumer_thread = threading.Thread(target=_consumer_loop, daemon=True)
-            _consumer_thread.start()
+            # Start consumer task
+            _consumer_task = asyncio.create_task(_consumer_loop())
             return
         except Exception as e:
             if logger.error_logger:
                 logger.error_logger.error(
                     f"Kafka connection failed (attempt {i + 1}/{retry_max}): {e}"
                 )
-            time.sleep((i + 1) * retry_interval)
+            await asyncio.sleep((i + 1) * retry_interval)
 
     # Connection failed, fallback to direct file write
     if logger.error_logger:
         logger.error_logger.error(
             f"Failed to connect to Kafka after {retry_max} attempts, falling back to direct file write"
         )
-    _disable_kafka()
+    await _disable_kafka()
 
 
-def stop_consumer() -> None:
+async def stop_consumer() -> None:
     """Stop Kafka consumer"""
-    global _consumer_thread
+    global _consumer_task, _consumer
 
-    _consumer_stop_event.set()
-    if _consumer_thread and _consumer_thread.is_alive():
-        _consumer_thread.join(timeout=5)
-    _consumer_thread = None
+    if _consumer_task:
+        _consumer_task.cancel()
+        try:
+            await _consumer_task
+        except asyncio.CancelledError:
+            pass
+        _consumer_task = None

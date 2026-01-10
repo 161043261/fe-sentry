@@ -1,6 +1,7 @@
-import signal
 import sys
 import os
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 # Add server directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -11,13 +12,39 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import config
 import logger
-import kafka_client
+import kafka
 from handler import router as api_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan manager"""
+    # Startup
+    try:
+        await kafka.init_producer()
+    except Exception as e:
+        if logger.error_logger:
+            logger.error_logger.warning(f"Kafka producer init warning: {e}")
+
+    await kafka.start_consumer_with_retry()
+
+    yield
+
+    # Shutdown
+    if logger.info_logger:
+        logger.info_logger.info("Shutting down...")
+
+    await kafka.stop_consumer()
+    await kafka.close_producer()
+    logger.close()
+
+    if logger.info_logger:
+        logger.info_logger.info("Server stopped")
 
 
 def create_app() -> FastAPI:
     """Create FastAPI application"""
-    app = FastAPI(title="FE-Sentry Server")
+    app = FastAPI(title="FE-Sentry Server", lifespan=lifespan)
 
     # CORS middleware
     app.add_middleware(
@@ -50,40 +77,8 @@ def main() -> None:
         print(f"Failed to init logger: {e}")
         sys.exit(1)
 
-    # Initialize Kafka Producer (optional, fallback to direct file write on failure)
-    try:
-        kafka_client.init_producer()
-    except Exception as e:
-        if logger.error_logger:
-            logger.error_logger.warning(f"Kafka producer init warning: {e}")
-
-    # Start Kafka Consumer (if Kafka enabled)
-    kafka_client.start_consumer_with_retry()
-
     # Create app
     app = create_app()
-
-    # Shutdown handler
-    def shutdown_handler(signum, frame):
-        if logger.info_logger:
-            logger.info_logger.info("Shutting down...")
-
-        # Stop Kafka consumer
-        kafka_client.stop_consumer()
-
-        # Close Kafka producer
-        kafka_client.close_producer()
-
-        # Close logger
-        logger.close()
-
-        if logger.info_logger:
-            logger.info_logger.info("Server stopped")
-
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
 
     # Start server
     if logger.info_logger:
